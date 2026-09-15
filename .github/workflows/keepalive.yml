@@ -10,6 +10,10 @@ on:
     - cron: '0 0 1 * *' # Runs on the 1st of every month
   workflow_dispatch:
 
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
 jobs:
   cronjob-based-github-action:
     name: Keepalive Task
@@ -25,4 +29,19 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git commit --allow-empty -m "chore: keepalive"
-          git push
+
+          # Another workflow (e.g. the hourly scraper) may push to main
+          # between the checkout above and this push. Rebase onto the
+          # latest remote commit and retry a few times instead of failing.
+          for i in 1 2 3 4 5; do
+            if git push; then
+              exit 0
+            fi
+            echo "Push rejected (attempt $i/5), rebasing onto latest main and retrying..."
+            git fetch origin main
+            git rebase origin/main
+            sleep $((i * 3))
+          done
+
+          echo "Failed to push after 5 attempts." >&2
+          exit 1
