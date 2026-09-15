@@ -1,0 +1,22 @@
+name: Keepalive Workflow
+
+on:
+  # NOTE: cron's day-of-month field only ranges 1-31, so a step value like
+  # '*/45' does NOT mean "every 45 days" -- it only ever matches day 1,
+  # making this run monthly. That's still well within GitHub's 60-day
+  # scheduled-workflow inactivity window, so it's fine -- just documenting
+  # it here so it isn't mistaken for a 45-day interval.
+  schedule:
+    - cron: '0 0 1 * *' # Runs on the 1st of every month
+  workflow_dispatch:
+
+jobs:
+  cronjob-based-github-action:
+    name: Keepalive Task
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: gautamkrishnar/keepalive-workflow@v2
