@@ -1,189 +1,205 @@
 """
-Fenix (IST) announcement -> Discord webhook bot.
-
-Reads the course's announcement RSS feed (authenticated, since this course's
-announcements are only visible to logged-in "Utilizadores Autenticados"),
-compares against a list of previously-seen announcement GUIDs, and posts any
-new ones to a Discord webhook.
-
-Auth strategy: session cookie, not scripted username/password login.
-Técnico now routes logins through "Fenix Connect", which supports 2FA and
-third-party identity providers -- a scripted form POST of username/password
-is fragile and may simply not work depending on your account's auth method.
-A copied session cookie is more reliable, at the cost of needing to be
-refreshed periodically (see README for how).
+Fenix Announcement -> Discord bot (HTML Scraper Version)
 """
 
+import html
 import json
 import os
+import re
 import sys
-import xml.etree.ElementTree as ET
-
+import urllib.parse
+from bs4 import BeautifulSoup
 import requests
 
-COURSE_RSS_URL = "https://fenix.tecnico.ulisboa.pt/disciplinas/IEECom/2026-2027/1-semestre/rss/announcement"
-COURSE_PAGE_URL = "https://fenix.tecnico.ulisboa.pt/disciplinas/IEECom/2026-2027/1-semestre/anuncios"
+# Settings
+FENIX_SESSION_COOKIE = os.environ.get("FENIX_SESSION_COOKIE", "").strip()
+FENIX_RSS_URL = os.environ.get("FENIX_RSS_URL", "").strip()  # Use full Announcements page URL here
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-SESSION_COOKIE = os.getenv("FENIX_SESSION_COOKIE")  # e.g. "JSESSIONID=abc123..."
-STORAGE_FILE = "seen_announcements.json"
-MAX_STORED_IDS = 100  # cap so the state file doesn't grow forever
-
-
-def build_session() -> requests.Session:
-    session = requests.Session()
-    session.headers.update({"User-Agent": "Mozilla/5.0 (fenix-announcement-bot)"})
-
-    if not SESSION_COOKIE:
-        print("ERROR: FENIX_SESSION_COOKIE is not set.", file=sys.stderr)
-        sys.exit(1)
-
-    # Accept either "name=value" or just "value" (assumes JSESSIONID).
-    if "=" in SESSION_COOKIE:
-        name, _, value = SESSION_COOKIE.partition("=")
-    else:
-        name, value = "JSESSIONID", SESSION_COOKIE
-
-    session.cookies.set(name.strip(), value.strip(), domain="fenix.tecnico.ulisboa.pt")
-    return session
+SEEN_FILE = "seen_announcements.json"
+MAX_SEEN_TO_KEEP = 500
 
 
-def fetch_announcements(session: requests.Session):
-    response = session.get(COURSE_RSS_URL, timeout=30)
+def load_seen():
+    """Read the list of announcement IDs already posted."""
+    if not os.path.exists(SEEN_FILE):
+        return {"seen_guids": []}
+    try:
+        with open(SEEN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if "seen_guids" not in data:
+                data["seen_guids"] = []
+            return data
+    except (json.JSONDecodeError, OSError):
+        print(f"WARNING: could not read {SEEN_FILE}, starting with an empty list.")
+        return {"seen_guids": []}
+
+
+def save_seen(data):
+    """Save updated list of announcement IDs."""
+    with open(SEEN_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def parse_cookie_string(cookie_string):
+    """Parse cookie header into key-value pairs."""
+    cookies = {}
+    for part in cookie_string.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        cookies[key.strip()] = value.strip()
+    return cookies
+
+
+def fetch_page():
+    """Download HTML content from Fenix course announcements page."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+    }
+    cookies = parse_cookie_string(FENIX_SESSION_COOKIE) if FENIX_SESSION_COOKIE else {}
+
+    response = requests.get(FENIX_RSS_URL, headers=headers, cookies=cookies, timeout=30)
     response.raise_for_status()
+    return response.text
 
-    # If the cookie is dead/expired, Fenix typically serves an HTML login
-    # page instead of RSS XML. Catch that explicitly instead of failing
-    # deep inside the XML parser with a confusing error.
-    content_type = response.headers.get("Content-Type", "")
-    if "xml" not in content_type and "<rss" not in response.text[:200].lower():
-        print(
-            "ERROR: Did not get an RSS/XML response -- the session cookie is "
-            "likely expired or invalid. Refresh FENIX_SESSION_COOKIE.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
-    root = ET.fromstring(response.text)
-    items = root.findall("./channel/item")
+def looks_like_login_page(html_content):
+    """Check if session cookie expired and Fenix returned a login prompt."""
+    sample = html_content[:2000].lower()
+    if "login" in sample and ("cas" in sample or "fenix" in sample) and "password" in sample:
+        return True
+    return False
 
-    announcements = []
-    for item in items:
-        guid_elem = item.find("guid")
-        title_elem = item.find("title")
-        link_elem = item.find("link")
-        desc_elem = item.find("description")
-        pubdate_elem = item.find("pubDate")
 
-        guid = (guid_elem.text or "").strip() if guid_elem is not None else None
-        title = (title_elem.text or "(no title)").strip() if title_elem is not None else "(no title)"
-        link = (link_elem.text or "").strip() if link_elem is not None else COURSE_PAGE_URL
-        description = (desc_elem.text or "").strip() if desc_elem is not None else ""
-        pub_date = (pubdate_elem.text or "").strip() if pubdate_elem is not None else ""
+def parse_announcements(html_content):
+    """Parse DOM elements from the announcements block."""
+    soup = BeautifulSoup(html_content, "html.parser")
+    container = soup.find(id="content-block") or soup
+    items = []
 
-        if not guid:
-            # Fall back to link as a de-dup key if guid is somehow missing.
-            guid = link or title
+    for h5 in container.find_all("h5"):
+        a_tag = h5.find("a")
+        if not a_tag or not a_tag.get("href"):
+            continue
 
-        announcements.append(
+        title = a_tag.get_text(strip=True)
+        link = urllib.parse.urljoin("https://fenix.tecnico.ulisboa.pt", a_tag["href"])
+        
+        # Deduplication GUID using the unique URL slug
+        guid = link.rstrip("/").split("/")[-1]
+
+        parent_div = h5.find_parent("div")
+        description = ""
+
+        if parent_div:
+            div_copy = BeautifulSoup(str(parent_div), "html.parser")
+            
+            # Remove title (h5) and metadata date/author paragraph (<p class="small">)
+            for tag in div_copy.find_all(["h5", "p"], class_=["small"]):
+                tag.decompose()
+            
+            # Remove duplicate title header inside body if present
+            for h2 in div_copy.find_all("h2"):
+                if h2.get_text(strip=True) == title:
+                    h2.decompose()
+
+            description = div_copy.get_text(separator="\n", strip=True)
+
+        items.append(
             {
-                "id": guid,
                 "title": title,
                 "link": link,
-                "body": description,
-                "pub_date": pub_date,
+                "guid": guid,
+                "description": description[:2000],
             }
         )
 
-    return announcements
+    return items
 
 
-def strip_html(text: str) -> str:
-    # RSS <description> content is HTML-escaped HTML. Very small, dependency-free
-    # tag stripper -- good enough for Discord embed text, not a full HTML parser.
-    import re
-
-    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
-    text = re.sub(r"<[^>]+>", "", text)
-    return text.strip()
-
-
-def send_to_discord(announcement: dict) -> bool:
-    body = strip_html(announcement["body"])[:1024] or "(no content)"
-
+def send_to_discord(item):
+    """Post single announcement embed to Discord webhook."""
     embed = {
-        "title": f"\U0001f4e2 New Announcement: {announcement['title']}"[:256],
-        "url": announcement["link"] or COURSE_PAGE_URL,
-        "color": 3447003,
-        "description": body,
-        "footer": {"text": "F\u00e9nix IEECom Updates"},
+        "title": item["title"][:256] or "New announcement",
+        "description": item["description"][:2048],
     }
-    if announcement["pub_date"]:
-        embed["fields"] = [{"name": "Posted", "value": announcement["pub_date"], "inline": False}]
+    if item["link"]:
+        embed["url"] = item["link"]
 
-    payload = {"embeds": [embed]}
+    payload = {
+        "content": "📢 New Fenix announcement",
+        "embeds": [embed],
+    }
 
-    try:
-        response = requests.post(WEBHOOK_URL, json=payload, timeout=15)
-        response.raise_for_status()
-        return True
-    except requests.RequestException as exc:
-        print(f"ERROR: failed to post to Discord for '{announcement['title']}': {exc}", file=sys.stderr)
-        return False
-
-
-def load_seen_ids() -> list:
-    try:
-        with open(STORAGE_FILE, "r") as f:
-            data = json.load(f)
-            return data.get("seen_ids", [])
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
-
-
-def save_seen_ids(seen_ids: list) -> None:
-    trimmed = seen_ids[-MAX_STORED_IDS:]
-    with open(STORAGE_FILE, "w") as f:
-        json.dump({"seen_ids": trimmed}, f, indent=2)
+    response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
+    return response.status_code in (200, 204)
 
 
 def main():
-    if not WEBHOOK_URL:
-        print("ERROR: WEBHOOK_URL is not set.", file=sys.stderr)
+    missing = []
+    if not FENIX_RSS_URL:
+        missing.append("FENIX_RSS_URL")
+    if not DISCORD_WEBHOOK_URL:
+        missing.append("DISCORD_WEBHOOK_URL")
+    if missing:
+        print(f"ERROR: missing required setting(s): {', '.join(missing)}")
         sys.exit(1)
 
-    session = build_session()
-    announcements = fetch_announcements(session)
+    try:
+        html_content = fetch_page()
+    except requests.exceptions.RequestException as e:
+        print(f"ERROR: could not reach Fenix: {e}")
+        sys.exit(1)
 
-    if not announcements:
-        print("No announcements found in feed.")
+    if looks_like_login_page(html_content):
+        print(
+            "ERROR: Fenix sent back a login page. "
+            "Your FENIX_SESSION_COOKIE has expired. Update it in Secrets."
+        )
+        sys.exit(1)
+
+    items = parse_announcements(html_content)
+
+    if not items:
+        print("Page fetched successfully, but zero announcements were found.")
         return
 
-    seen_ids = load_seen_ids()
-    seen_set = set(seen_ids)
+    seen_data = load_seen()
+    seen_guids = set(seen_data.get("seen_guids", []))
+    new_items = [item for item in items if item["guid"] not in seen_guids]
 
-    # RSS feeds are newest-first; reverse so we post in chronological order
-    # if several are new at once (and so Discord message order matches
-    # actual posting order).
-    new_announcements = [a for a in announcements if a["id"] not in seen_set]
-    new_announcements.reverse()
-
-    if not new_announcements:
-        print("No new announcements.")
+    if not new_items:
+        print(f"Checked {len(items)} announcement(s). Nothing new.")
         return
 
-    print(f"Found {len(new_announcements)} new announcement(s).")
+    new_items.reverse()
 
-    posted_ids = []
-    for announcement in new_announcements:
-        print(f" - Posting: {announcement['title']}")
-        if send_to_discord(announcement):
-            posted_ids.append(announcement["id"])
-        # If a post fails, we deliberately don't mark it seen, so it's
-        # retried on the next run instead of being silently dropped.
+    print(f"Found {len(new_items)} new announcement(s). Posting to Discord...")
+    newly_posted_guids = []
+    for item in new_items:
+        try:
+            ok = send_to_discord(item)
+        except requests.exceptions.RequestException as e:
+            ok = False
+            print(f"  FAILED (network error) to post '{item['title']}': {e}")
 
-    if posted_ids:
-        save_seen_ids(seen_ids + posted_ids)
+        if ok:
+            print(f"  Posted: {item['title']}")
+            newly_posted_guids.append(item["guid"])
+        else:
+            print(f"  FAILED to post '{item['title']}' - will retry next run.")
+
+    if newly_posted_guids:
+        seen_guids.update(newly_posted_guids)
+        seen_data["seen_guids"] = list(seen_guids)[-MAX_SEEN_TO_KEEP:]
+        save_seen(seen_data)
 
 
 if __name__ == "__main__":
