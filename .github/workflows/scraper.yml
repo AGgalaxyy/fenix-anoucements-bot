@@ -24,7 +24,8 @@ jobs:
 
       - name: Run scraper
         env:
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          FENIX_RSS_URL: ${{ secrets.FENIX_RSS_URL }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           FENIX_SESSION_COOKIE: ${{ secrets.FENIX_SESSION_COOKIE }}
         run: python bot.py
 
