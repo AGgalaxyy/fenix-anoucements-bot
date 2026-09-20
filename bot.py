@@ -57,7 +57,7 @@ def parse_cookie_string(cookie_string):
 
 
 def fetch_page():
-    """Download HTML content from Fenix course announcements page."""
+    """Download the announcements page and return the complete HTTP response."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -87,17 +87,37 @@ def fetch_page():
         headers=headers,
         cookies=cookies,
         timeout=(15, 60),
+        allow_redirects=True,
     )
     response.raise_for_status()
-    return response.text
+    return response
 
 
-def looks_like_login_page(html_content):
-    """Check if session cookie expired and Fenix returned a login prompt."""
-    sample = html_content[:2000].lower()
-    if "login" in sample and ("cas" in sample or "fenix" in sample) and "password" in sample:
+def looks_like_login_page(response):
+    """Detect an expired session or a redirect to Fenix authentication."""
+    final_url = response.url.lower()
+    html_content = response.text
+    soup = BeautifulSoup(html_content, "html.parser")
+
+    # Authentication redirects are the most reliable indication that the cookie
+    # was rejected. Do not print the URL because it may contain sensitive data.
+    if any(marker in final_url for marker in ("login", "auth", "cas")):
         return True
-    return False
+
+    title = soup.title.get_text(" ", strip=True).lower() if soup.title else ""
+    if any(marker in title for marker in ("login", "sign in", "autenticação", "autenticacao")):
+        return True
+
+    password_field = soup.find(
+        "input",
+        attrs={"type": lambda value: value and value.lower() == "password"},
+    )
+    login_form = soup.find(
+        "form",
+        attrs={"action": lambda value: value and "login" in value.lower()},
+    )
+
+    return password_field is not None or login_form is not None
 
 
 def parse_announcements(html_content):
@@ -113,7 +133,7 @@ def parse_announcements(html_content):
 
         title = a_tag.get_text(strip=True)
         link = urllib.parse.urljoin("https://fenix.tecnico.ulisboa.pt", a_tag["href"])
-        
+
         # Deduplication GUID using the unique URL slug
         guid = link.rstrip("/").split("/")[-1]
 
@@ -122,11 +142,11 @@ def parse_announcements(html_content):
 
         if parent_div:
             div_copy = BeautifulSoup(str(parent_div), "html.parser")
-            
+
             # Remove title (h5) and metadata date/author paragraph (<p class="small">)
             for tag in div_copy.find_all(["h5", "p"], class_=["small"]):
                 tag.decompose()
-            
+
             # Remove duplicate title header inside body if present
             for h2 in div_copy.find_all("h2"):
                 if h2.get_text(strip=True) == title:
@@ -175,18 +195,20 @@ def main():
         sys.exit(1)
 
     try:
-        html_content = fetch_page()
+        response = fetch_page()
     except requests.exceptions.RequestException as e:
         print(f"ERROR: could not reach Fenix after retries: {e}")
         sys.exit(1)
 
-    if looks_like_login_page(html_content):
+    if looks_like_login_page(response):
         print(
-            "ERROR: Fenix sent back a login page. "
-            "Your FENIX_SESSION_COOKIE has expired. Update it in Secrets."
+            "ERROR: Fenix returned a login page. "
+            "Your FENIX_SESSION_COOKIE may be expired or invalid. "
+            "Update it in GitHub Secrets."
         )
         sys.exit(1)
 
+    html_content = response.text
     items = parse_announcements(html_content)
 
     if not items:
