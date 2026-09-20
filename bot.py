@@ -67,8 +67,6 @@ def fetch_page():
     }
     cookies = parse_cookie_string(FENIX_SESSION_COOKIE) if FENIX_SESSION_COOKIE else {}
 
-    # Fenix can be temporarily unreachable. Retry connection errors and transient
-    # server responses with exponential backoff before failing the job.
     retry = Retry(
         total=5,
         connect=5,
@@ -96,11 +94,8 @@ def fetch_page():
 def looks_like_login_page(response):
     """Detect an expired session or a redirect to Fenix authentication."""
     final_url = response.url.lower()
-    html_content = response.text
-    soup = BeautifulSoup(html_content, "html.parser")
+    soup = BeautifulSoup(response.text, "html.parser")
 
-    # Authentication redirects are the most reliable indication that the cookie
-    # was rejected. Do not print the URL because it may contain sensitive data.
     if any(marker in final_url for marker in ("login", "auth", "cas")):
         return True
 
@@ -116,51 +111,70 @@ def looks_like_login_page(response):
         "form",
         attrs={"action": lambda value: value and "login" in value.lower()},
     )
-
     return password_field is not None or login_form is not None
 
 
-def parse_announcements(html_content):
-    """Parse DOM elements from the announcements block."""
-    soup = BeautifulSoup(html_content, "html.parser")
-    container = soup.find(id="content-block") or soup
-    items = []
+def announcement_from_heading(heading):
+    """Convert a linked heading into an announcement record."""
+    link_tag = heading.find("a", href=True) if heading.name != "a" else heading
+    if not link_tag:
+        return None
 
-    for h5 in container.find_all("h5"):
-        a_tag = h5.find("a")
-        if not a_tag or not a_tag.get("href"):
-            continue
+    title = link_tag.get_text(" ", strip=True)
+    link = urllib.parse.urljoin("https://fenix.tecnico.ulisboa.pt", link_tag["href"])
+    if not title or not link:
+        return None
 
-        title = a_tag.get_text(strip=True)
-        link = urllib.parse.urljoin("https://fenix.tecnico.ulisboa.pt", a_tag["href"])
-
-        # Deduplication GUID using the unique URL slug
-        guid = link.rstrip("/").split("/")[-1]
-
-        parent_div = h5.find_parent("div")
-        description = ""
-
-        if parent_div:
-            div_copy = BeautifulSoup(str(parent_div), "html.parser")
-
-            # Remove title (h5) and metadata date/author paragraph (<p class="small">)
-            for tag in div_copy.find_all(["h5", "p"], class_=["small"]):
+    guid = link.rstrip("/").split("/")[-1]
+    parent = heading.find_parent(["article", "li", "div"]) or heading.parent
+    description = ""
+    if parent:
+        copy = BeautifulSoup(str(parent), "html.parser")
+        for tag in copy.find_all(["h2", "h3", "h4", "h5", "p"], class_=["small"]):
+            tag.decompose()
+        for tag in copy.find_all(["h2", "h3", "h4", "h5"]):
+            if tag.get_text(" ", strip=True) == title:
                 tag.decompose()
+        description = copy.get_text(separator="\n", strip=True)
 
-            # Remove duplicate title header inside body if present
-            for h2 in div_copy.find_all("h2"):
-                if h2.get_text(strip=True) == title:
-                    h2.decompose()
+    return {
+        "title": title,
+        "link": link,
+        "guid": guid,
+        "description": description[:2000],
+    }
 
-            description = div_copy.get_text(separator="\n", strip=True)
 
-        items.append(
-            {
-                "title": title,
-                "link": link,
-                "guid": guid,
-                "description": description[:2000],
-            }
+def parse_announcements(html_content):
+    """Parse announcements across the heading layouts used by Fenix."""
+    soup = BeautifulSoup(html_content, "html.parser")
+    container = (
+        soup.find(id="content-block")
+        or soup.find(id="content")
+        or soup.find(class_=lambda value: value and "announcement" in " ".join(value) if isinstance(value, list) else value and "announcement" in value)
+        or soup
+    )
+
+    items = []
+    seen_links = set()
+
+    # Older Fenix pages use linked h5 headings; newer layouts may use h2-h4,
+    # article headings, or an element whose class contains "announcement".
+    candidates = container.find_all(["h2", "h3", "h4", "h5"])
+    candidates += [tag for tag in container.find_all(class_=lambda value: value and "announcement" in (" ".join(value) if isinstance(value, list) else value)) if tag.find("a", href=True)]
+
+    for candidate in candidates:
+        item = announcement_from_heading(candidate)
+        if item and item["link"] not in seen_links:
+            seen_links.add(item["link"])
+            items.append(item)
+
+    if not items:
+        print(
+            "DEBUG: no announcements matched; "
+            f"page_title={soup.title.get_text(' ', strip=True) if soup.title else '<none>'}, "
+            f"headings={len(soup.find_all(['h2', 'h3', 'h4', 'h5']))}, "
+            f"links={len(soup.find_all('a', href=True))}"
         )
 
     return items
@@ -175,13 +189,15 @@ def send_to_discord(item):
     if item["link"]:
         embed["url"] = item["link"]
 
-    payload = {
-        "content": "📢 New Fenix announcement",
-        "embeds": [embed],
-    }
-
-    response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
-    return response.status_code in (200, 204)
+    response = requests.post(
+        DISCORD_WEBHOOK_URL,
+        json={"content": "📢 New Fenix announcement", "embeds": [embed]},
+        timeout=15,
+    )
+    if response.status_code not in (200, 204):
+        print(f"Discord webhook failed: HTTP {response.status_code} - {response.text[:500]}")
+        return False
+    return True
 
 
 def main():
@@ -201,16 +217,10 @@ def main():
         sys.exit(1)
 
     if looks_like_login_page(response):
-        print(
-            "ERROR: Fenix returned a login page. "
-            "Your FENIX_SESSION_COOKIE may be expired or invalid. "
-            "Update it in GitHub Secrets."
-        )
+        print("ERROR: Fenix returned a login page. Your FENIX_SESSION_COOKIE may be expired or invalid.")
         sys.exit(1)
 
-    html_content = response.text
-    items = parse_announcements(html_content)
-
+    items = parse_announcements(response.text)
     if not items:
         print("Page fetched successfully, but zero announcements were found.")
         return
@@ -224,7 +234,6 @@ def main():
         return
 
     new_items.reverse()
-
     print(f"Found {len(new_items)} new announcement(s). Posting to Discord...")
     newly_posted_guids = []
     for item in new_items:
@@ -233,7 +242,6 @@ def main():
         except requests.exceptions.RequestException as e:
             ok = False
             print(f"  FAILED (network error) to post '{item['title']}': {e}")
-
         if ok:
             print(f"  Posted: {item['title']}")
             newly_posted_guids.append(item["guid"])
