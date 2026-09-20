@@ -10,6 +10,8 @@ import sys
 import urllib.parse
 from bs4 import BeautifulSoup
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Settings
 FENIX_SESSION_COOKIE = os.environ.get("FENIX_SESSION_COOKIE", "").strip()
@@ -65,7 +67,27 @@ def fetch_page():
     }
     cookies = parse_cookie_string(FENIX_SESSION_COOKIE) if FENIX_SESSION_COOKIE else {}
 
-    response = requests.get(FENIX_RSS_URL, headers=headers, cookies=cookies, timeout=30)
+    # Fenix can be temporarily unreachable. Retry connection errors and transient
+    # server responses with exponential backoff before failing the job.
+    retry = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        status=5,
+        backoff_factor=2,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+
+    response = session.get(
+        FENIX_RSS_URL,
+        headers=headers,
+        cookies=cookies,
+        timeout=(15, 60),
+    )
     response.raise_for_status()
     return response.text
 
@@ -155,7 +177,7 @@ def main():
     try:
         html_content = fetch_page()
     except requests.exceptions.RequestException as e:
-        print(f"ERROR: could not reach Fenix: {e}")
+        print(f"ERROR: could not reach Fenix after retries: {e}")
         sys.exit(1)
 
     if looks_like_login_page(html_content):
