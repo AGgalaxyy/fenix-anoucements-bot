@@ -2,14 +2,16 @@ name: Fenix Announcement Scraper
 
 on:
   schedule:
-    - cron: '17 * * * *' # Checks every hour, at :17 past
+    - cron: "17 * * * *"
   workflow_dispatch:
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+
     permissions:
       contents: write
+
     steps:
       - name: Check out code
         uses: actions/checkout@v4
@@ -17,10 +19,12 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
 
       - name: Install dependencies
-        run: pip install requests beautifulsoup4
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4
 
       - name: Run scraper
         env:
@@ -29,9 +33,21 @@ jobs:
           FENIX_SESSION_COOKIE: ${{ secrets.FENIX_SESSION_COOKIE }}
         run: python bot.py
 
-      - name: Save state & push
+      - name: Save state and push
+        if: always()
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add seen_announcements.json || true
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Update seen announcements" && git push)
+
+          if [ -f seen_announcements.json ]; then
+            git add seen_announcements.json
+
+            if ! git diff --cached --quiet; then
+              git commit -m "Update seen announcements"
+              git push
+            else
+              echo "No state changes to commit."
+            fi
+          else
+            echo "No announcements were posted; no state file was created."
+          fi
