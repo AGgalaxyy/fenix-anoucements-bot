@@ -2,12 +2,11 @@
 Fenix Announcement -> Discord bot (HTML Scraper Version)
 """
 
-import html
 import json
 import os
-import re
 import sys
 import urllib.parse
+
 from bs4 import BeautifulSoup
 import requests
 from requests.adapters import HTTPAdapter
@@ -15,58 +14,51 @@ from urllib3.util.retry import Retry
 
 # Settings
 FENIX_SESSION_COOKIE = os.environ.get("FENIX_SESSION_COOKIE", "").strip()
-FENIX_RSS_URL = os.environ.get("FENIX_RSS_URL", "").strip()  # Use full Announcements page URL here
+FENIX_RSS_URL = os.environ.get("FENIX_RSS_URL", "").strip()
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 
 SEEN_FILE = "seen_announcements.json"
 MAX_SEEN_TO_KEEP = 500
+BASE_URL = "https://fenix.tecnico.ulisboa.pt"
 
 
 def load_seen():
-    """Read the list of announcement IDs already posted."""
     if not os.path.exists(SEEN_FILE):
         return {"seen_guids": []}
     try:
         with open(SEEN_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            if "seen_guids" not in data:
-                data["seen_guids"] = []
-            return data
+        data.setdefault("seen_guids", [])
+        return data
     except (json.JSONDecodeError, OSError):
         print(f"WARNING: could not read {SEEN_FILE}, starting with an empty list.")
         return {"seen_guids": []}
 
 
 def save_seen(data):
-    """Save updated list of announcement IDs."""
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
         f.write("\n")
 
 
 def parse_cookie_string(cookie_string):
-    """Parse cookie header into key-value pairs."""
     cookies = {}
     for part in cookie_string.split(";"):
         part = part.strip()
-        if not part or "=" not in part:
-            continue
-        key, value = part.split("=", 1)
-        cookies[key.strip()] = value.strip()
+        if part and "=" in part:
+            key, value = part.split("=", 1)
+            cookies[key.strip()] = value.strip()
     return cookies
 
 
 def fetch_page():
-    """Download the announcements page and return the complete HTTP response."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0.0.0 Safari/537.36"
-        ),
+        )
     }
-    cookies = parse_cookie_string(FENIX_SESSION_COOKIE) if FENIX_SESSION_COOKIE else {}
-
     retry = Retry(
         total=5,
         connect=5,
@@ -79,11 +71,10 @@ def fetch_page():
     )
     session = requests.Session()
     session.mount("https://", HTTPAdapter(max_retries=retry))
-
     response = session.get(
         FENIX_RSS_URL,
         headers=headers,
-        cookies=cookies,
+        cookies=parse_cookie_string(FENIX_SESSION_COOKIE),
         timeout=(15, 60),
         allow_redirects=True,
     )
@@ -92,47 +83,38 @@ def fetch_page():
 
 
 def looks_like_login_page(response):
-    """Detect an expired session or a redirect to Fenix authentication."""
     final_url = response.url.lower()
     soup = BeautifulSoup(response.text, "html.parser")
-
+    title = soup.title.get_text(" ", strip=True).lower() if soup.title else ""
     if any(marker in final_url for marker in ("login", "auth", "cas")):
         return True
-
-    title = soup.title.get_text(" ", strip=True).lower() if soup.title else ""
     if any(marker in title for marker in ("login", "sign in", "autenticação", "autenticacao")):
         return True
-
-    password_field = soup.find(
-        "input",
-        attrs={"type": lambda value: value and value.lower() == "password"},
-    )
-    login_form = soup.find(
-        "form",
-        attrs={"action": lambda value: value and "login" in value.lower()},
-    )
-    return password_field is not None or login_form is not None
+    return soup.find("input", attrs={"type": lambda value: value and value.lower() == "password"}) is not None
 
 
-def announcement_from_heading(heading):
-    """Convert a linked heading into an announcement record."""
-    link_tag = heading.find("a", href=True) if heading.name != "a" else heading
-    if not link_tag:
-        return None
-
+def announcement_from_link(link_tag):
+    href = link_tag.get("href")
     title = link_tag.get_text(" ", strip=True)
-    link = urllib.parse.urljoin("https://fenix.tecnico.ulisboa.pt", link_tag["href"])
-    if not title or not link:
+    if not href or not title:
         return None
 
-    guid = link.rstrip("/").split("/")[-1]
-    parent = heading.find_parent(["article", "li", "div"]) or heading.parent
+    link = urllib.parse.urljoin(BASE_URL, href)
+    parsed = urllib.parse.urlparse(link)
+    path = parsed.path.lower()
+
+    # Avoid navigation, login, and generic page links. Announcement detail URLs
+    # on Fenix normally remain below the course's /anuncios path.
+    if any(part in path for part in ("/login", "/auth", "/logout", "/inscricoes", "/horarios")):
+        return None
+    if not any(part in path for part in ("/anuncio", "/announcement", "/announcements")):
+        return None
+
+    parent = link_tag.find_parent(["article", "li", "div"]) or link_tag.parent
     description = ""
     if parent:
         copy = BeautifulSoup(str(parent), "html.parser")
-        for tag in copy.find_all(["h2", "h3", "h4", "h5", "p"], class_=["small"]):
-            tag.decompose()
-        for tag in copy.find_all(["h2", "h3", "h4", "h5"]):
+        for tag in copy.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
             if tag.get_text(" ", strip=True) == title:
                 tag.decompose()
         description = copy.get_text(separator="\n", strip=True)
@@ -140,55 +122,50 @@ def announcement_from_heading(heading):
     return {
         "title": title,
         "link": link,
-        "guid": guid,
+        "guid": link.rstrip("/").split("/")[-1],
         "description": description[:2000],
     }
 
 
 def parse_announcements(html_content):
-    """Parse announcements across the heading layouts used by Fenix."""
+    """Find announcement detail links instead of relying on one heading layout."""
     soup = BeautifulSoup(html_content, "html.parser")
-    container = (
-        soup.find(id="content-block")
-        or soup.find(id="content")
-        or soup.find(class_=lambda value: value and "announcement" in " ".join(value) if isinstance(value, list) else value and "announcement" in value)
-        or soup
-    )
-
+    container = soup.find(id="content-block") or soup.find(id="content") or soup
     items = []
     seen_links = set()
 
-    # Older Fenix pages use linked h5 headings; newer layouts may use h2-h4,
-    # article headings, or an element whose class contains "announcement".
-    candidates = container.find_all(["h2", "h3", "h4", "h5"])
-    candidates += [tag for tag in container.find_all(class_=lambda value: value and "announcement" in (" ".join(value) if isinstance(value, list) else value)) if tag.find("a", href=True)]
-
-    for candidate in candidates:
-        item = announcement_from_heading(candidate)
+    # Scan every link. This handles Fenix pages where announcements are rendered
+    # as divs/list items rather than linked h5 headings.
+    for link_tag in container.find_all("a", href=True):
+        item = announcement_from_link(link_tag)
         if item and item["link"] not in seen_links:
             seen_links.add(item["link"])
             items.append(item)
 
     if not items:
+        title = soup.title.get_text(" ", strip=True) if soup.title else "<none>"
+        sample_links = [
+            urllib.parse.urljoin(BASE_URL, a["href"])
+            for a in container.find_all("a", href=True)[:10]
+        ]
         print(
-            "DEBUG: no announcements matched; "
-            f"page_title={soup.title.get_text(' ', strip=True) if soup.title else '<none>'}, "
-            f"headings={len(soup.find_all(['h2', 'h3', 'h4', 'h5']))}, "
-            f"links={len(soup.find_all('a', href=True))}"
+            "DEBUG: no announcement links matched; "
+            f"page_title={title}; links={len(container.find_all('a', href=True))}; "
+            f"sample_links={sample_links}"
         )
+    else:
+        print(f"Parsed {len(items)} announcement link(s) from Fenix.")
 
     return items
 
 
 def send_to_discord(item):
-    """Post single announcement embed to Discord webhook."""
     embed = {
         "title": item["title"][:256] or "New announcement",
         "description": item["description"][:2048],
     }
     if item["link"]:
         embed["url"] = item["link"]
-
     response = requests.post(
         DISCORD_WEBHOOK_URL,
         json={"content": "📢 New Fenix announcement", "embeds": [embed]},
@@ -201,19 +178,15 @@ def send_to_discord(item):
 
 
 def main():
-    missing = []
-    if not FENIX_RSS_URL:
-        missing.append("FENIX_RSS_URL")
-    if not DISCORD_WEBHOOK_URL:
-        missing.append("DISCORD_WEBHOOK_URL")
+    missing = [name for name, value in (("FENIX_RSS_URL", FENIX_RSS_URL), ("DISCORD_WEBHOOK_URL", DISCORD_WEBHOOK_URL)) if not value]
     if missing:
         print(f"ERROR: missing required setting(s): {', '.join(missing)}")
         sys.exit(1)
 
     try:
         response = fetch_page()
-    except requests.exceptions.RequestException as e:
-        print(f"ERROR: could not reach Fenix after retries: {e}")
+    except requests.exceptions.RequestException as exc:
+        print(f"ERROR: could not reach Fenix after retries: {exc}")
         sys.exit(1)
 
     if looks_like_login_page(response):
@@ -228,28 +201,27 @@ def main():
     seen_data = load_seen()
     seen_guids = set(seen_data.get("seen_guids", []))
     new_items = [item for item in items if item["guid"] not in seen_guids]
-
     if not new_items:
         print(f"Checked {len(items)} announcement(s). Nothing new.")
         return
 
     new_items.reverse()
     print(f"Found {len(new_items)} new announcement(s). Posting to Discord...")
-    newly_posted_guids = []
+    posted = []
     for item in new_items:
         try:
             ok = send_to_discord(item)
-        except requests.exceptions.RequestException as e:
+        except requests.exceptions.RequestException as exc:
             ok = False
-            print(f"  FAILED (network error) to post '{item['title']}': {e}")
+            print(f"FAILED (network error) to post '{item['title']}': {exc}")
         if ok:
-            print(f"  Posted: {item['title']}")
-            newly_posted_guids.append(item["guid"])
+            print(f"Posted: {item['title']}")
+            posted.append(item["guid"])
         else:
-            print(f"  FAILED to post '{item['title']}' - will retry next run.")
+            print(f"FAILED to post '{item['title']}' - will retry next run.")
 
-    if newly_posted_guids:
-        seen_guids.update(newly_posted_guids)
+    if posted:
+        seen_guids.update(posted)
         seen_data["seen_guids"] = list(seen_guids)[-MAX_SEEN_TO_KEEP:]
         save_seen(seen_data)
 
