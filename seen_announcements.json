@@ -1,3 +1,8 @@
 {
-  "seen_ids": []
+  "seen_ids": [],
+  "seen_guids": [
+    "enunciados-semana-3",
+    "inicio-das-aulas",
+    "enunciados-semana-2"
+  ]
 }
