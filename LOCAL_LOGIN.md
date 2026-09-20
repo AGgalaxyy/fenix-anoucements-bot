@@ -1,25 +1,35 @@
-# Local interactive-login test
+# Local interactive login setup
 
-This branch contains a **local-only** login test. It opens a visible browser and lets you log in to Fénix normally. It does not collect, store, or submit your Técnico password.
+This branch is prepared for a local-only test. It does not automate or store your Técnico password.
 
-## Install
+## One-time setup (PowerShell)
 
 ```powershell
-python -m pip install requests beautifulsoup4 playwright
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements-local.txt
 python -m playwright install chromium
+Copy-Item .env.example .env.local
+notepad .env.local
 ```
+
+Put your Discord webhook in `.env.local`. Leave the Fénix URL unchanged unless you need a different course.
 
 ## Run
 
-Set the Discord webhook only in your local PowerShell session:
+Set the values from `.env.local` in the current PowerShell window:
 
 ```powershell
-$env:DISCORD_WEBHOOK_URL = "paste-your-webhook-here"
+Get-Content .env.local | ForEach-Object {
+    if ($_ -match '^\s*([^#=][^=]*)=(.*)$') {
+        [Environment]::SetEnvironmentVariable($matches[1].Trim(), $matches[2].Trim(), 'Process')
+    }
+}
 python local_login_bot.py
 ```
 
-A browser opens. Log in to Fénix, complete any verification, open the announcements page, then return to the terminal and press Enter.
+A visible Chromium window opens. Log in to Fénix normally in that window, complete any 2FA if requested, open the announcements page, then return to the terminal and press Enter. New announcements are sent to Discord.
 
-The browser session exists only in memory and is closed when the script ends. Do not put a username, password, cookie, or browser storage file in the repository.
+The browser session is held only in memory and is closed when the script exits. Do not create or commit a password file, cookie, `fenix-auth.json`, or browser storage state. The GitHub Actions workflow remains separate and uses its existing session-cookie secret.
 
-This script is intentionally local-only; the GitHub Actions workflow remains cookie-based because a GitHub runner cannot safely perform your interactive personal login.
+If PowerShell blocks activation, run the commands without activating the virtual environment by replacing `python` with `.venv\Scripts\python.exe`.
