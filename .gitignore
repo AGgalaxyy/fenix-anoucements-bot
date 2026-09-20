@@ -1,0 +1,5 @@
+# Never commit browser sessions or local secrets.
+fenix-auth.json
+fenix-storage.json
+.env
+__pycache__/
